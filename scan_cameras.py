@@ -27,7 +27,9 @@ import concurrent.futures as cf
 import ipaddress
 import json
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import time
 import urllib.request
@@ -77,6 +79,10 @@ VENDOR_KEYWORDS = [
     ("thttpd", "Generic IPCam"), ("ipcam", "Generic IPCam"),
     ("webcam", "Generic IPCam"), ("ip camera", "Generic IPCam"),
     ("network camera", "Generic IPCam"), ("netcam", "Generic IPCam"),
+    ("netatmo", "Netatmo"), ("chuangmi", "Xiaomi"), ("isa-camera", "Xiaomi"),
+    ("ring-", "Ring"), ("ringdoorbell", "Ring"), ("blink", "Blink"),
+    ("nest-cam", "Google Nest"), ("nestcam", "Google Nest"), ("google-nest", "Google Nest"),
+    ("somfy", "Somfy"), ("kami", "Kami/YI"), ("eken", "Eken"), ("ieGeek".lower(), "ieGeek"),
     ("nvr", "NVR"), ("dvr", "DVR"), ("onvif", "ONVIF"),
 ]
 CAMERA_WORDS = ("camera", "cam", "ipc", "nvr", "dvr", "video", "onvif",
@@ -108,10 +114,31 @@ def local_ip():
 
 
 def tcp_open(ip, port, timeout):
+    return tcp_probe(ip, port, timeout) == "open"
+
+
+def tcp_probe(ip, port, timeout):
+    """'open', 'refused' (port closed but the host is alive) or None (no answer)."""
     try:
         with socket.create_connection((ip, port), timeout=timeout):
-            return True
+            return "open"
+    except ConnectionRefusedError:
+        return "refused"
     except OSError:
+        return None
+
+
+PING = shutil.which("ping")
+
+
+def ping(ip):
+    """True if the host answers ICMP echo (uses the system ping, no root needed)."""
+    if not PING:
+        return False
+    try:
+        return subprocess.run([PING, "-c", "1", "-W", "1", ip], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=3).returncode == 0
+    except Exception:
         return False
 
 
@@ -365,7 +392,7 @@ def classify(dev):
               and vendor_from_text(upnp.get("manufacturer")) else None) or vendor_from_text(blob)
     keyword_hit = vendor is not None or any(w in blob.lower() for w in CAMERA_WORDS)
     if keyword_hit:
-        reasons.append("banner")
+        reasons.append("name/banner")
 
     if dev.get("onvif") or dev.get("rtsp") or strong:
         kind = "camera"
@@ -440,20 +467,31 @@ def main():
         jobs = [(ip, p) for ip in hosts for p in ALL_PORTS]
         done = 0
         with cf.ThreadPoolExecutor(args.workers) as ex:
-            futs = {ex.submit(tcp_open, ip, p, args.timeout): (ip, p) for ip, p in jobs}
+            futs = {ex.submit(tcp_probe, ip, p, args.timeout): (ip, p) for ip, p in jobs}
             for f in cf.as_completed(futs):
                 done += 1
                 ip, p = futs[f]
-                if f.result():
+                state = f.result()
+                if state == "open":
                     dev(ip)["ports"].append(p)
+                elif state == "refused":
+                    dev(ip)  # host is alive even though the port is closed
                 if not args.json and done % 500 == 0:
                     print(f"\r    {done * 100 // len(jobs):3d}%", end="", flush=True)
         if not args.json:
             print("\r    100%")
 
+        # Ping sweep: finds devices with no open port at all (cloud cameras,
+        # phones, TVs...). Their network name often reveals what they are.
+        log("  - Ping sweep (finds devices with no open port) ...")
+        with cf.ThreadPoolExecutor(64) as ex:
+            for ip, alive in zip(hosts, ex.map(ping, hosts)):
+                if alive:
+                    dev(ip)
+
     # 4: fingerprint
     devices.pop(me, None)
-    log(f"  - Fingerprinting {len(devices)} responding devices ...")
+    log(f"  - Fingerprinting {len(devices)} devices found on the network ...")
     with cf.ThreadPoolExecutor(32) as ex:
         fps = {ip: ex.submit(fingerprint, ip, sorted(d["ports"]), args.timeout)
                for ip, d in devices.items()}
@@ -478,8 +516,9 @@ def main():
 
     print()
     if not rows:
-        print("No camera found. Tips: make sure the phone is on the same Wi-Fi (not guest"
-              " network / client isolation), and try --all to see every device.")
+        print("No camera found. Run with --all to list every device and its network name;"
+              " cloud cameras (Ring, Nest, Tapo, Imou...) expose no port and can only be"
+              " recognised by name. Your router's connected-devices page also lists them.")
         return
     for d in rows:
         tag = {"camera": "[CAMERA]  ", "possible": "[POSSIBLE]", "other": "[other]   "}[d["kind"]]
